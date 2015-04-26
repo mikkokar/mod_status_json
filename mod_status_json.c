@@ -155,7 +155,68 @@ static void show_time(request_rec *r, apr_uint32_t tsecs)
         ap_rprintf(r, " %d second%s", secs, secs == 1 ? "" : "s");
 }
 
-/* static write_server_info(js_serialiser_t *s, r*/
+static void write_server_info(js_serialiser_t *s, request_rec *r)
+{
+    apr_uint32_t up_time;
+    apr_time_t nowtime;
+    ap_loadavg_t t;
+    ap_generation_t mpm_generation;
+    unsigned long count;
+    
+    nowtime = apr_time_now();
+
+    /* up_time in seconds */
+    up_time = (apr_uint32_t) apr_time_sec(nowtime -
+                               ap_scoreboard_image->global->restart_time);
+    ap_get_loadavg(&t);
+
+
+    js_object(s, "server");
+    js_string(s, "name", ap_escape_html(r->pool, ap_get_server_name(r)));
+    js_string(s, "via", r->connection->local_ip);
+    js_string(s, "version", ap_get_server_description());
+    js_string(s, "serverMPM", ap_show_mpm());
+    js_string(s, "serverBuilt", ap_get_server_built());
+    js_string(s, "currentTime: ",
+              ap_ht_time(r->pool, nowtime, DEFAULT_TIME_FORMAT, 0));
+    js_string(s, "restartTime: ",
+              ap_ht_time(r->pool, 
+                         ap_scoreboard_image->global->restart_time,
+                         DEFAULT_TIME_FORMAT, 0));
+    js_int_number(s, "parent-config-generation",
+                  ap_state_query(AP_SQ_CONFIG_GEN));
+    js_int_number(s, "parent-server-MPM-Generation", (int)mpm_generation);
+
+    /* TODO: Mikko, fix uptime:
+    js_int_number(&s, "serverUptime", uptime);
+        ap_rputs("  ServerUptime: " DQUOTE, r);
+        show_time(r, up_time);
+    */
+
+    js_object(s, "load");
+    js_number(s, "avg", t.loadavg);
+    js_number(s, "avg5:", t.loadavg5);
+    js_number(s, "avg15:", t.loadavg15);
+    js_object_end(s);
+    js_object_end(s);
+
+
+    js_int_number(s, "totalAccesses", count);
+}
+
+static void write_cpu_usage(js_serialiser_t *s,
+                            clock_t tu, clock_t ts, clock_t tcu, clock_t tcs,
+                            apr_uint32_t up_time, float tick)
+{
+    js_object(s, "cpuUsage");
+    js_number(s, "u", tu/tick); 
+    js_number(s, "s", ts/tick);
+    js_number(s, "cu", tcu/tick);
+    js_number(s, "cs", tcs/tick);
+    if (ts || tu || tcu || tcs)
+       js_number(s, "load:", (tu + ts + tcu + tcs) / tick / up_time * 100.);
+    js_object_end(s);
+}
 
 /* Main handler for x-httpd-status requests */
 
@@ -410,17 +471,16 @@ static int status_handler(request_rec *r)
         pid_buffer[i] = ps_record->pid;
     }
 
-#define DQUOTE "\""
     js_document4(&s, print_to_response, r, 1);
 
-
-
-    /* up_time in seconds */
     up_time = (apr_uint32_t) apr_time_sec(nowtime -
                                ap_scoreboard_image->global->restart_time);
     ap_get_loadavg(&t);
 
+    write_server_info(&s, r);
 
+    /* up_time in seconds */
+    /*
     js_object(&s, "server");
     js_string(&s, "name", ap_escape_html(r->pool, ap_get_server_name(r)));
     js_string(&s, "via", r->connection->local_ip);
@@ -436,20 +496,20 @@ static int status_handler(request_rec *r)
     js_int_number(&s, "parent-config-generation",
                   ap_state_query(AP_SQ_CONFIG_GEN));
     js_int_number(&s, "parent-server-MPM-Generation", (int)mpm_generation);
-
+    */
     /* TODO: Mikko, fix uptime:
     js_int_number(&s, "serverUptime", uptime);
         ap_rputs("  ServerUptime: " DQUOTE, r);
         show_time(r, up_time);
     */
-
+    /*
     js_object(&s, "load");
     js_number(&s, "avg", t.loadavg);
     js_number(&s, "avg5:", t.loadavg5);
     js_number(&s, "avg15:", t.loadavg15);
     js_object_end(&s);
     js_object_end(&s);
-
+    */
 
     js_int_number(&s, "totalAccesses", count);
     
@@ -458,15 +518,8 @@ static int status_handler(request_rec *r)
             format_kbyte_out(r, kbcount);
     */
 #ifdef HAVE_TIMES
-            /* Allow for OS/2 not having CPU stats */
-    js_object(&s, "cpuUsage");
-    js_number(&s, "u", tu/tick); 
-    js_number(&s, "s", ts/tick);
-    js_number(&s, "cu", tcu/tick);
-    js_number(&s, "cs", tcs/tick);
-    if (ts || tu || tcu || tcs)
-       js_number(&s, "cpuLoad:", (tu + ts + tcu + tcs) / tick / up_time * 100.);
-    js_object_end(&s);
+    /* Allow for OS/2 not having CPU stats */
+    write_cpu_usage(&s, tu, ts, tcu, tcs, up_time, tick);
 #endif
 
     js_number(&s, "requestsPersec", (float)count/(float)up_time);

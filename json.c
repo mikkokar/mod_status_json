@@ -138,7 +138,7 @@ void js_document_end(js_serialiser_t *s)
     s->print(s->call_arg, "}");
 }
 
-void js_object(js_serialiser_t *s, char *name)
+void js_object(js_serialiser_t *s, const char *name)
 {
     link_to_previous(s);
     indent_if_pretty(s);
@@ -166,7 +166,7 @@ void js_object_end(js_serialiser_t *s)
     s->print(s->call_arg, "}");
 }
 
-void js_array(js_serialiser_t *s, char *name)
+void js_array(js_serialiser_t *s, const char *name)
 {
     link_to_previous(s);
     indent_if_pretty(s);
@@ -193,7 +193,7 @@ void js_array_end(js_serialiser_t *s)
     s->print(s->call_arg, "]");
 }
 
-void js_number(struct js_serialiser *s, char *name, double value)
+void js_number(struct js_serialiser *s, const char *name, double value)
 {
     link_to_previous(s);
     indent_if_pretty(s);
@@ -208,7 +208,7 @@ void js_number(struct js_serialiser *s, char *name, double value)
      }
 }
 
-void js_int_number(struct js_serialiser *s, char *name, long value)
+void js_int_number(struct js_serialiser *s, const char *name, long value)
 {
     link_to_previous(s);
     indent_if_pretty(s);
@@ -223,7 +223,7 @@ void js_int_number(struct js_serialiser *s, char *name, long value)
     }
 }
 
-void js_string(js_serialiser_t *s, char *name, char *value)
+void js_string(js_serialiser_t *s, const char *name, const char *value)
 {
     link_to_previous(s);
     indent_if_pretty(s);
@@ -238,7 +238,7 @@ void js_string(js_serialiser_t *s, char *name, char *value)
      }
 }
 
-void js_boolean(js_serialiser_t *s, char *name, int boolean)
+void js_boolean(js_serialiser_t *s, const char *name, int boolean)
 {
     link_to_previous(s);
     indent_if_pretty(s);
