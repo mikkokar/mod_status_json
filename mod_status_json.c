@@ -74,6 +74,7 @@
 #endif
 
 #define STATUS_MAGIC_TYPE "application/x-httpd-status"
+#define TEMP_STR_LENGTH 512
 
 module AP_MODULE_DECLARE_DATA status_json_module;
 
@@ -218,6 +219,32 @@ static void write_cpu_usage(js_serialiser_t *s,
     js_object_end(s);
 }
 
+static void write_process_record(js_serialiser_t *s, process_score *ps_record,
+                                 int busy_workers, int idle_workers)
+{
+    js_object(s, "");
+
+    /* TODO: Mikko: Potentially platform specific code. 
+     *              Apache mod_status used APR_PID_T_FMT as 
+     *              a format string.
+     */
+    js_int_number(s, "pid", ps_record->pid);
+    js_object(s, "connections");
+      js_int_number(s, "total", ps_record->connections);
+      js_boolean(s, "accepting", !ps_record->not_accepting);
+      js_object(s, "async");
+        js_int_number(s, "writing", ps_record->write_completion);
+        js_int_number(s, "keepAlive", ps_record->keep_alive);
+        js_int_number(s, "closing", ps_record->lingering_close);
+      js_object_end(s);
+      js_object_end(s);
+    js_object(s, "threads");
+      js_int_number(s, "busy", busy_workers);
+      js_int_number(s, "idle", idle_workers);
+    js_object_end(s);
+   js_object_end(s);
+}
+
 /* Main handler for x-httpd-status requests */
 
 /* ID values for command table */
@@ -253,6 +280,193 @@ static void print_to_response(void *call_arg, const char *output)
     ap_rprintf(r, "%s", output);
 }
 
+static int all_threads_dead(int i, int thread_limit, char *stat_buffer)
+{
+    int j = 0;
+
+    for (j = 0; j < thread_limit; ++j) {
+        int indx = (i * thread_limit) + j;
+        if (stat_buffer[indx] != '.' && stat_buffer[indx] != ' ') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
+static void write_threads_summary(js_serialiser_t *s,
+                                  int server_limit,
+                                  int thread_limit,
+                                  char *stat_buffer,
+                                  char status_flags[])
+{
+    int i = 0;
+    int j = 0;
+
+    for (i = 0; i < server_limit; ++i) {
+        if (all_threads_dead(i, thread_limit, stat_buffer)) {
+            continue;
+        }
+
+        js_object(s, "");
+        js_int_number(s, "server-id", i);
+        js_array(s, "states");
+
+        for (j = 0; j < thread_limit; ++j) {
+            int indx = (i * thread_limit) + j;
+            if (stat_buffer[indx] != status_flags[SERVER_DISABLED]) {
+                js_string(s, "", to_textual_state(stat_buffer[indx]));
+            }
+        }
+        js_array_end(s);
+        js_object_end(s);
+    }
+}
+
+static void write_server_activity(js_serialiser_t *s,
+                                  int server_limit,
+                                  int thread_limit,
+                                  worker_score *ws_record,
+                                  request_rec *r,
+                                  apr_time_t nowtime)
+{
+    int i;
+    int j;
+    process_score *ps_record;
+    long req_time;
+    unsigned long lres, my_lres, conn_lres;
+    apr_off_t bytes, my_bytes, conn_bytes;
+    ap_generation_t mpm_generation, worker_generation;
+    pid_t *pid_buffer, worker_pid;
+    float tick;
+
+    js_array(s, "serverActivity");
+
+    for (i = 0; i < server_limit; ++i) {
+        for (j = 0; j < thread_limit; ++j) {
+            ap_copy_scoreboard_worker(ws_record, i, j);
+
+            if (ws_record->access_count == 0 &&
+               (ws_record->status == SERVER_READY ||
+                ws_record->status == SERVER_DEAD)) {
+                continue;
+            }
+
+            ps_record = ap_get_scoreboard_process(i);
+
+            if (ws_record->start_time == 0L)
+                req_time = 0L;
+            else
+                req_time = (long)
+                    ((ws_record->stop_time -
+                      ws_record->start_time) / 1000);
+            if (req_time < 0L)
+                req_time = 0L;
+
+            lres       = ws_record->access_count;
+            my_lres    = ws_record->my_access_count;
+            conn_lres  = ws_record->conn_count;
+            bytes      = ws_record->bytes_served;
+            my_bytes   = ws_record->my_bytes_served;
+            conn_bytes = ws_record->conn_bytes;
+
+    
+            if (ws_record->pid) { // MPM sets per-worker pid and generation
+                worker_pid = ws_record->pid;
+                worker_generation = ws_record->generation;
+            }
+            else {
+                worker_pid = ps_record->pid;
+                worker_generation = ps_record->generation;
+            }
+
+            js_object(s, "");
+            /*
+             * TODO, Mikko: prints Srv, PID, and Acc columns:
+             */
+            js_int_number(s, "serverChildNumber", i);
+            js_int_number(s, "workerGeneration", worker_generation);
+            if (ws_record->status == SERVER_DEAD) {
+                js_int_number(s, "pid", -1);
+            }
+            else {
+                js_int_number(s, "pid", worker_pid);
+            }
+            js_object(s, "accesses");
+            js_int_number(s, "connection", conn_lres);
+            js_int_number(s, "child", my_lres);
+            js_int_number(s, "slot", lres);
+            js_object_end(s);
+
+            /* TODO,  Mikko: prints M column: */
+            switch (ws_record->status) {
+            case SERVER_READY:
+                js_string(s, "mode", "_");
+                break;
+            case SERVER_STARTING:
+                js_string(s, "mode", "S");
+                break;
+            case SERVER_BUSY_READ:
+                js_string(s, "mode", "R");
+                break;
+            case SERVER_BUSY_WRITE:
+                js_string(s, "mode", "W");
+                break;
+            case SERVER_BUSY_KEEPALIVE:
+                js_string(s, "mode", "K");
+                break;
+            case SERVER_BUSY_LOG:
+                js_string(s, "mode", "L");
+                break;
+            case SERVER_BUSY_DNS:
+                js_string(s, "mode", "D");
+                break;
+            case SERVER_CLOSING:
+                js_string(s, "mode", "C");
+                break;
+            case SERVER_DEAD:
+                js_string(s, "mode", ".");
+                break;
+            case SERVER_GRACEFUL:
+                js_string(s, "mode", "G");
+                break;
+            case SERVER_IDLE_KILL:
+                js_string(s, "mode", "I");
+                break;
+            default:
+                js_string(s, "mode", "?");
+                break;
+            }
+
+#ifdef HAVE_TIMES
+            js_number(s, "cpu", (ws_record->times.tms_utime +
+                                ws_record->times.tms_stime +
+                                ws_record->times.tms_cutime +
+                                ws_record->times.tms_cstime) / tick);
+#endif
+            js_int_number(s, "sinceMostRecentSec", (long)apr_time_sec(nowtime -
+                                                    ws_record->last_used));
+            js_int_number(s, "processingTimeMs", req_time);
+
+            js_number(s, "kbytesOnThisConnection", (double)conn_bytes/KBYTE);
+            js_number(s, "mbytesOnThisConnection", (double)my_bytes/MBYTE);
+            js_number(s, "totalMBytesOnThisSlot", (double)bytes/MBYTE);
+
+            /* TODO, Mikko: Should be escape_json in following: */
+            js_string(s, "client", ap_escape_html(r->pool,
+                                              ws_record->client));
+            js_string(s, "vHost", ap_escape_html(r->pool,
+                                              ws_record->vhost));
+            js_string(s, "request", ap_escape_html(r->pool,
+                                              ap_escape_logitem(r->pool,
+                                                      ws_record->request)));
+            js_object_end(s);
+        } // for (j...) 
+    } // for (i...) 
+
+    js_array_end(s);
+}
+
 
 
 static int status_handler(request_rec *r)
@@ -286,7 +500,6 @@ static int status_handler(request_rec *r)
     js_serialiser_t s;
 
 
-    #define TEMP_STR_LENGTH 512
     char temp_str[TEMP_STR_LENGTH];
   
 
@@ -479,38 +692,6 @@ static int status_handler(request_rec *r)
 
     write_server_info(&s, r);
 
-    /* up_time in seconds */
-    /*
-    js_object(&s, "server");
-    js_string(&s, "name", ap_escape_html(r->pool, ap_get_server_name(r)));
-    js_string(&s, "via", r->connection->local_ip);
-    js_string(&s, "version", ap_get_server_description());
-    js_string(&s, "serverMPM", ap_show_mpm());
-    js_string(&s, "serverBuilt", ap_get_server_built());
-    js_string(&s, "currentTime: ",
-              ap_ht_time(r->pool, nowtime, DEFAULT_TIME_FORMAT, 0));
-    js_string(&s, "restartTime: ",
-              ap_ht_time(r->pool, 
-                         ap_scoreboard_image->global->restart_time,
-                         DEFAULT_TIME_FORMAT, 0));
-    js_int_number(&s, "parent-config-generation",
-                  ap_state_query(AP_SQ_CONFIG_GEN));
-    js_int_number(&s, "parent-server-MPM-Generation", (int)mpm_generation);
-    */
-    /* TODO: Mikko, fix uptime:
-    js_int_number(&s, "serverUptime", uptime);
-        ap_rputs("  ServerUptime: " DQUOTE, r);
-        show_time(r, up_time);
-    */
-    /*
-    js_object(&s, "load");
-    js_number(&s, "avg", t.loadavg);
-    js_number(&s, "avg5:", t.loadavg5);
-    js_number(&s, "avg15:", t.loadavg15);
-    js_object_end(&s);
-    js_object_end(&s);
-    */
-
     js_int_number(&s, "totalAccesses", count);
     
     /* TODO, Mikko, Fix this:
@@ -555,186 +736,22 @@ static int status_handler(request_rec *r)
         for (i = 0; i < server_limit; ++i) {
             ps_record = ap_get_scoreboard_process(i);
             if (ps_record->pid) {
-                connections      += ps_record->connections;
-                write_completion += ps_record->write_completion;
-                keep_alive       += ps_record->keep_alive;
-                lingering_close  += ps_record->lingering_close;
-                busy_workers     += thread_busy_buffer[i];
-                idle_workers     += thread_idle_buffer[i];
-
-
-                js_object(&s, "");
-
-                /* TODO: Mikko: Potentially platform specific code. 
-                 *              Apache mod_status used APR_PID_T_FMT as 
-                 *              a format string.
-                 */
-                js_int_number(&s, "pid", ps_record->pid);
-                js_object(&s, "connections");
-		  js_int_number(&s, "total", ps_record->connections);
-		  js_boolean(&s, "accepting", !ps_record->not_accepting);
-                  js_object(&s, "async");
-                    js_int_number(&s, "writing", ps_record->write_completion);
-                    js_int_number(&s, "keepAlive", ps_record->keep_alive);
-                    js_int_number(&s, "closing", ps_record->lingering_close);
-                  js_object_end(&s);
-                  js_object_end(&s);
-                js_object(&s, "threads");
-                  js_int_number(&s, "busy", thread_busy_buffer[i]);
-                  js_int_number(&s, "idle", thread_idle_buffer[i]);
-                js_object_end(&s);
-               js_object_end(&s);
-            }
+                write_process_record(&s, ps_record,
+                                     thread_busy_buffer[i],
+                                     thread_idle_buffer[i]);
+           }
         }
         js_array_end(&s);
     }
 
     written = 0;
 
-    js_object(&s, "servers");
-    for (i = 0; i < server_limit; ++i) {
-        snprintf(temp_str, TEMP_STR_LENGTH, "server-%d", i);
-
-        js_object(&s, temp_str);
-        js_int_number(&s, "id", i);
-        js_array(&s, "threadStates");
-
-	for (j = 0; j < thread_limit; ++j) {
-            int indx = (i * thread_limit) + j;
-            if (stat_buffer[indx] != status_flags[SERVER_DISABLED]) {
-                js_string(&s, "", to_textual_state(stat_buffer[indx]));
-            }
-        }
-        js_array_end(&s);
-        js_object_end(&s);
-    }
-    js_object_end(&s);
-
-    js_array(&s, "serverActivity");
-    for (i = 0; i < server_limit; ++i) {
-        for (j = 0; j < thread_limit; ++j) {
-            ap_copy_scoreboard_worker(ws_record, i, j);
-
-            if (ws_record->access_count == 0 &&
-               (ws_record->status == SERVER_READY ||
-                ws_record->status == SERVER_DEAD)) {
-                continue;
-            }
-
-            ps_record = ap_get_scoreboard_process(i);
-
-            if (ws_record->start_time == 0L)
-                req_time = 0L;
-            else
-                req_time = (long)
-                    ((ws_record->stop_time -
-                      ws_record->start_time) / 1000);
-            if (req_time < 0L)
-                req_time = 0L;
-
-            lres       = ws_record->access_count;
-            my_lres    = ws_record->my_access_count;
-            conn_lres  = ws_record->conn_count;
-            bytes      = ws_record->bytes_served;
-            my_bytes   = ws_record->my_bytes_served;
-            conn_bytes = ws_record->conn_bytes;
-
-    
-            if (ws_record->pid) { // MPM sets per-worker pid and generation
-                worker_pid = ws_record->pid;
-                worker_generation = ws_record->generation;
-            }
-            else {
-                worker_pid = ps_record->pid;
-                worker_generation = ps_record->generation;
-            }
-
-            js_object(&s, "");
-            /*
-             * TODO, Mikko: prints Srv, PID, and Acc columns:
-             */
-            js_int_number(&s, "serverChildNumber", i);
-            js_int_number(&s, "workerGeneration", worker_generation);
-            if (ws_record->status == SERVER_DEAD) {
-                js_int_number(&s, "pid", -1);
-            }
-            else {
-                js_int_number(&s, "pid", worker_pid);
-            }
-            js_object(&s, "accesses");
-            js_int_number(&s, "connection", conn_lres);
-            js_int_number(&s, "child", my_lres);
-            js_int_number(&s, "slot", lres);
-            js_object_end(&s); 
-
-
-            /* TODO,  Mikko: prints M column: */
-            switch (ws_record->status) {
-            case SERVER_READY:
-                js_string(&s, "mode", "_");
-                break;
-            case SERVER_STARTING:
-                js_string(&s, "mode", "S");
-                break;
-            case SERVER_BUSY_READ:
-                js_string(&s, "mode", "R");
-                break;
-            case SERVER_BUSY_WRITE:
-                js_string(&s, "mode", "W");
-                break;
-            case SERVER_BUSY_KEEPALIVE:
-                js_string(&s, "mode", "K");
-                break;
-            case SERVER_BUSY_LOG:
-                js_string(&s, "mode", "L");
-                break;
-            case SERVER_BUSY_DNS:
-                js_string(&s, "mode", "D");
-                break;
-            case SERVER_CLOSING:
-                js_string(&s, "mode", "C");
-                break;
-            case SERVER_DEAD:
-                js_string(&s, "mode", ".");
-                break;
-            case SERVER_GRACEFUL:
-                js_string(&s, "mode", "G");
-                break;
-            case SERVER_IDLE_KILL:
-                js_string(&s, "mode", "I");
-                break;
-            default:
-                js_string(&s, "mode", "?");
-                break;
-            }
-
-#ifdef HAVE_TIMES
-            js_number(&s, "cpu", (ws_record->times.tms_utime +
-                                ws_record->times.tms_stime +
-                                ws_record->times.tms_cutime +
-                                ws_record->times.tms_cstime) / tick);
-#endif
-            js_int_number(&s, "sinceMostRecentSec", (long)apr_time_sec(nowtime -
-                                                    ws_record->last_used));
-            js_int_number(&s, "processingTimeMs", req_time);
-
-            js_number(&s, "kbytesOnThisConnection", (double)conn_bytes/KBYTE);
-            js_number(&s, "mbytesOnThisConnection", (double)my_bytes/MBYTE);
-            js_number(&s, "totalMBytesOnThisSlot", (double)bytes/MBYTE);
-
-            /* TODO, Mikko: Should be escape_json in following: */
-            js_string(&s, "client", ap_escape_html(r->pool,
-                                              ws_record->client));
-            js_string(&s, "vHost", ap_escape_html(r->pool,
-                                              ws_record->vhost));
-            js_string(&s, "request", ap_escape_html(r->pool,
-                                              ap_escape_logitem(r->pool,
-                                                      ws_record->request)));
-            js_object_end(&s);
-        } // for (j...) 
-    } // for (i...) 
-
+    js_array(&s, "threads");
+    write_threads_summary(&s, server_limit, thread_limit,
+                          stat_buffer, status_flags);
     js_array_end(&s);
+
+    write_server_activity(&s, server_limit, thread_limit, ws_record, r, nowtime);
     {
         // Run extension hooks to insert extra content.
         int flags =
